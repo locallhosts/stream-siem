@@ -1,279 +1,532 @@
-# Real-Time Stream Processing SIEM
+# Stream SIEM
 
-A working (not toy) log pipeline: Go forwarders → Kafka → Apache Flink
-(windowed + stateful detection) → ClickHouse for analyst queries, with
-alerts also republished to a Kafka topic for downstream SOAR/dashboards.
+A real-time security telemetry pipeline built around **Go, Apache Kafka, Apache Flink, ClickHouse, and Python**.
+
+The project ingests authentication, DNS, and firewall telemetry; parses it into a common event model; applies stateful, event-time detection; persists enriched events and alerts in ClickHouse; and republishes alerts to Kafka for downstream automation.
+
+![Stream SIEM smoke-test output](docs/smoke_test_results.png)
+
+> The screenshot above is from the repository's local smoke test: detector logic was run against generated telemetry and the resulting events and alerts were inserted into a running ClickHouse instance. The load generator uses reserved documentation IP ranges for simulated external destinations.
+
+---
+
+## Architecture
 
 ```
-[Go forwarders] --> [Kafka: siem.raw.events] --> [Flink job] --+--> [ClickHouse: enriched_events, alerts]
-                                                                 +--> [Kafka: siem.alerts]
+                    Synthetic logs / real log sources
+                                  |
+                                  v
+                         +----------------+
+                         | Go Forwarder   |
+                         | file + syslog  |
+                         +-------+--------+
+                                 |
+                                 v
+                    +-------------------------+
+                    | Apache Kafka             |
+                    | siem.raw.events          |
+                    +------------+--------------+
+                                 |
+                                 v
+                    +-------------------------+
+                    | Apache Flink             |
+                    | event-time processing    |
+                    | parsing + detection      |
+                    +------------+--------------+
+                                 |
+                  +--------------+---------------+
+                  |                              |
+                  v                              v
+        +-------------------+          +-------------------+
+        | ClickHouse        |          | Kafka             |
+        | enriched_events   |          | siem.alerts       |
+        | alerts             |          | dead letters      |
+        +-------------------+          +-------------------+
 ```
 
-## What's actually implemented, and how it was verified
+### Detection pipeline
 
-Everything below was built as real source, not pseudocode, and I verified
-what this sandboxed environment's network restrictions actually let me
-verify:
+The Flink job uses the timestamp contained in each log event rather than ingestion time.
 
-| Component | Status |
+1. Kafka provides raw envelopes.
+2. Flink parses the source-specific log format.
+3. Invalid JSON, unknown source types, and parse failures are sent to a dead-letter topic.
+4. Parsed events receive event-time timestamps.
+5. Bounded-out-of-orderness watermarks handle out-of-order delivery.
+6. Stateful detectors evaluate authentication, firewall, and DNS behavior.
+7. Alerts are written to ClickHouse and published to Kafka.
+8. Late authentication events that exceed the configured allowed lateness are routed to a dedicated dead-letter stream.
+
+---
+
+## Detection capabilities
+
+### Failed-login rate
+
+Detects repeated authentication failures from a source IP using a **5-minute tumbling event-time window**.
+
+- Key: source IP
+- Default threshold: 10 failed logins
+- Event-time processing
+- Configurable threshold
+- Alert score increases with the observed failure count
+
+This detector is intended to identify brute-force-style authentication activity while keeping the implementation inexpensive for high-volume authentication streams.
+
+### Beaconing
+
+Detects repeated outbound connections whose inter-arrival times are unusually regular.
+
+The detector:
+
+- keys state by `sourceIp|destIp`
+- keeps a bounded timestamp buffer
+- calculates inter-arrival intervals
+- calculates the coefficient of variation (CV)
+- requires a minimum number of observations
+- constrains the average interval to a configurable range
+- expires inactive state after 15 minutes
+- applies a cooldown so an established beacon does not generate an alert on every event
+
+The important signal is **regularity**, not a specific destination or fixed interval. This makes the detector useful for identifying periodic callback behavior with jitter.
+
+### DNS tunneling
+
+Detects DNS activity whose subdomain entropy is statistically unusual relative to an offline-trained baseline.
+
+The streaming detector:
+
+- keys state by source IP
+- calculates Shannon entropy for query labels
+- maintains running count, sum, and sum-of-squares
+- uses O(1) state per source IP
+- evaluates a configurable tumbling window
+- calculates a z-score against the trained baseline
+- emits an alert when the z-score exceeds the configured threshold
+
+The baseline trainer in `ml-model/` uses a **median + MAD-based robust scale estimate**, which reduces the influence of contaminated training data.
+
+---
+
+## Event-time and late-data handling
+
+The pipeline is deliberately event-time based.
+
+For DNS and firewall logs, timestamps are parsed directly from the RFC3339 event timestamp. Authentication logs use the traditional RFC3164-style timestamp and therefore require a year to be inferred.
+
+Flink uses:
+
+- **30-second bounded out-of-orderness**
+- **2-minute source idleness detection**
+- **30-second allowed lateness for the failed-login window**
+- a dead-letter side output for authentication events that arrive after the allowed-lateness boundary
+
+This means a delayed event is not automatically treated as a new real-time event. Window behavior is driven by the event timestamp and watermark progression.
+
+> **RFC3164 limitation:** traditional syslog authentication timestamps do not contain a year. The current parser uses the current UTC year. Deployments that replay logs across a year boundary should use a source with an explicit year (for example RFC5424) or normalize the timestamp upstream.
+
+---
+
+## Delivery and recovery semantics
+
+Flink checkpointing is configured for **exactly-once state consistency**:
+
+```java
+env.enableCheckpointing(30_000, CheckpointingMode.EXACTLY_ONCE);
+```
+
+This protects Flink's managed state and Kafka source offsets during recovery.
+
+The external sinks currently have different guarantees:
+
+| Component | Current behavior |
 |---|---|
-| Go forwarder (file tail + syslog UDP → Kafka) | **Compiles and runs.** Built with a real Go toolchain in this environment (`go build` succeeded on both binaries). |
-| Synthetic load generator (`cmd/loadgen`) | **Compiles and runs.** Ran it for 70s; confirmed the planted beaconing sources fire at their ~30s interval and the DNS-tunneling source emits high-entropy queries — see below. |
-| Flink job (Java) | **Written, not compiled here.** This sandbox's network egress doesn't allow Maven Central, so `mvn package` can't run in this container. I hand-verified the parser regexes against the actual synthetic log output (see below) and the logic against Flink's documented APIs, but you should run `mvn test` yourself before trusting it in anger — see "Before you rely on this" below. |
-| ClickHouse schema | Written; column names/order cross-checked against the JDBC sink's INSERT statements. |
-| Python offline entropy model | **Ran for real** against the synthetic DNS log and produced a valid model JSON matching the Java `DnsTunnelingModelParams` schema exactly. |
-| docker-compose stack | Written; not brought up in this sandbox (no Docker available here). |
+| Flink managed state | Exactly-once checkpoint semantics |
+| Kafka alert sink | At-least-once |
+| ClickHouse JDBC sink | At-least-once |
 
-**Cross-component integration check that actually ran, end to end:**
-Go loadgen → real `auth.log`/`dns.log`/`firewall.log` files → Python
-`train_dns_entropy_model.py` trained a real model off 14,062 real generated
-DNS queries → produced `model_params.json` in the exact shape the Flink job
-expects. Separately, I ported each Java parser's regex into Python and
-matched it against the actual generated log lines byte-for-byte — all three
-(auth, dns, firewall) matched, field for field, including the planted
-beacon line.
+A task restart can therefore replay a sink batch. The current ClickHouse schema uses `MergeTree`; it does not implement sink-level deduplication.
 
-### Before you rely on this
-1. `cd flink-job && mvn test` — the two test classes
-   (`BeaconingDetectorTest`, `EntropyUtilTest`) use Flink's real
-   `KeyedOneInputStreamOperatorTestHarness` and should catch anything
-   subtly wrong with the state/timer logic.
-2. `docker compose up -d`, then build and submit the Flink job (below).
-3. `docker compose --profile loadgen up loadgen` and watch
-   `docker compose logs -f flink-jobmanager | grep ALERT` — you should see
-   beaconing alerts within ~2-3 minutes and a DNS-tunneling alert within the
-   first minute or two.
+For a deployment that requires stronger end-to-end guarantees, the write path would need an explicit idempotency/deduplication strategy or transactional sink design.
 
-## Quick start
+---
+
+## Data model
+
+### Parsed event types
+
+The current parsers support:
+
+| Source | Example data |
+|---|---|
+| `auth` | SSH accepted/failed authentication |
+| `dns` | DNS query and source IP |
+| `firewall` | ALLOW/DENY, protocol, source, destination, port |
+
+All sources are normalized into the shared `ParsedEvent` model before detection.
+
+### ClickHouse
+
+The `siem` database contains:
+
+- `enriched_events` — normalized security telemetry
+- `alerts` — detector output
+- `alert_hourly_rollup` — aggregated alert counts and maximum scores
+- a materialized view that maintains the hourly alert rollup
+
+The primary sort keys are designed around source type, source IP, and event time for common analyst queries.
+
+Retention is configured in the schema as:
+
+- enriched events: **90 days**
+- alerts: **365 days**
+
+Adjust these values for the retention and compliance requirements of the environment where the system is deployed.
+
+---
+
+## Synthetic load generator
+
+The Go load generator produces realistic-looking authentication, DNS, and firewall records at a configurable rate.
+
+It deliberately plants known detection patterns so the pipeline can be tested against ground truth:
+
+- two beaconing sources
+- one DNS-tunneling source
+- normal authentication failures
+- ordinary DNS queries
+- ordinary outbound firewall traffic
+
+The generator uses:
+
+```
+203.0.113.0/24
+198.51.100.0/24
+```
+
+for simulated external destinations. These are reserved documentation ranges, so they should not be interpreted as real C2 infrastructure or company-owned addresses.
+
+Example:
+
+```
+10.0.6.200  -> 198.51.100.77:443
+10.0.6.201  -> 198.51.100.77:443
+10.0.7.50   -> high-entropy DNS labels
+```
+
+The generator is deterministic by default through a fixed PRNG seed, making repeated test runs easier to compare.
+
+---
+
+## Local development
+
+### Requirements
+
+- Docker and Docker Compose
+- Go
+- Java 17
+- Maven
+- Python 3
+
+### 1. Start the infrastructure
+
+From the repository root:
 
 ```bash
-# 1. Bring up Kafka, ClickHouse, Flink, and the forwarder
 docker compose up -d
+```
 
-# 2. Build the Flink job's fat jar
-cd flink-job && mvn -q package && cd ..
+This starts:
 
-# 3. Submit it
+- Kafka
+- ClickHouse
+- Flink JobManager
+- Flink TaskManagers
+- Go forwarder
+
+The load generator is optional and is not started by the default Compose profile.
+
+### 2. Build the Flink job
+
+```bash
+cd flink-job
+mvn test
+mvn package
+cd ..
+```
+
+The package step produces the fat JAR used by the Flink cluster.
+
+### 3. Submit the Flink job
+
+```bash
 docker compose exec flink-jobmanager flink run \
   -c com.siem.jobs.SiemStreamJob \
   /opt/flink/usrlib/siem-flink-job-1.0.0.jar
+```
 
-# 4. Generate synthetic traffic (planted beaconing + DNS tunneling included)
+### 4. Generate test telemetry
+
+```bash
 docker compose --profile loadgen up loadgen
+```
 
-# 5. Watch alerts
+The default load generator runs at 2,000 events/second for 30 minutes.
+
+For a shorter local run, execute the binary directly:
+
+```bash
+cd go-forwarder
+go run ./cmd/loadgen -rate 1000 -duration 2m -out-dir ./synthetic-logs
+```
+
+### 5. Watch the pipeline
+
+Flink Web UI:
+
+```
+http://localhost:8081
+```
+
+Kafka alert stream:
+
+```bash
 docker compose logs -f flink-jobmanager | grep ALERT
+```
 
-# 6. Query ClickHouse directly
+ClickHouse:
+
+```bash
 docker compose exec clickhouse clickhouse-client --database=siem \
   --query "SELECT * FROM alerts ORDER BY detected_at DESC LIMIT 20"
 ```
 
-Flink Web UI: http://localhost:8081 — watch per-operator watermarks,
-checkpoint durations, and backpressure live.
+---
 
-## Watermarking and late data — what happens, precisely
+## Local smoke test
 
-This is the part of the brief that's easy to fake with a one-line
-`.assignTimestampsAndWatermarks()` call and never actually think through, so
-here's what this job does and why (see `SiemStreamJob.java` for the code):
+The repository includes `tools/local_pipeline_smoke_test.py`.
 
-**Event time, not processing time.** Each `ParsedEvent.eventTimeMillis` is
-parsed out of the *log line's own timestamp* — sshd's `Sep 17 10:22:01`, or
-the RFC3339 stamp on DNS/firewall lines — not the time the Go forwarder
-observed it, and not Flink's wall-clock processing time. This matters
-because forwarders batch (`batch_timeout: 1s` by default) and can fall
-behind under load or after a restart-and-catch-up; if the job partitioned
-work by processing time instead, a burst of replayed/delayed events would
-get attributed to the wrong time bucket, and the beaconing detector's
-"~30s apart" math would be measuring queueing delay, not the actual
-callback interval.
+It is a fast, single-process validation path for:
 
-**Watermark strategy: bounded out-of-orderness, 30 seconds, with idleness
-detection.**
-```java
-WatermarkStrategy.<ParsedEvent>forBoundedOutOfOrderness(Duration.ofSeconds(30))
-    .withTimestampAssigner((event, ts) -> event.eventTimeMillis)
-    .withIdleness(Duration.ofMinutes(2))
-```
-The watermark for the whole job is `max(event time seen so far) - 30s`,
-computed as the *minimum* across all active Kafka partitions (Flink's
-standard rule: the job can't claim "everything before T has arrived" until
-every partition agrees). Thirty seconds covers realistic forwarder-batching
-and network jitter without holding windows open so long that a 5-minute
-failed-login window doesn't fire until nearly 5.5 minutes have passed.
+- log parser compatibility
+- detector behavior
+- alert generation
+- ClickHouse insertion
+- schema compatibility
 
-`withIdleness(2 min)`: if one source_type's partition goes quiet (e.g. no
-firewall traffic for a while), its watermark would otherwise never advance,
-and since the combined watermark is a minimum, that one silent partition
-would stall window-firing for *every* key across the whole job — not just
-the silent one. Marking a partition idle after 2 minutes lets Flink exclude
-it from the minimum until it produces again.
+Example:
 
-**What happens to data that arrives after its window's watermark has
-already passed (the actual question this brief asks):**
-1. The `failed_login_rate` detector runs on a genuine `TumblingEventTimeWindows`
-   window with `.allowedLateness(30s)`. An event arriving after the window's
-   `end` time but within 30s of it *still gets included*, and the window
-   re-fires an updated result via `ProcessWindowFunction` — this is Flink's
-   built-in late-firing mechanism, not something bespoke.
-2. An event arriving *after* `end + allowedLateness` (genuinely late, not
-   just late-ish) cannot be included in that window anymore — the window's
-   state has been discarded. Flink's default behavior is to silently drop
-   it. **This job does not do that**: `.sideOutputLateData(LATE_AUTH_TAG)`
-   routes truly-late events to a side output, which this job pipes to the
-   `siem.dead-letters` Kafka topic instead of the void. In production
-   you'd alert if that topic's volume is ever nonzero and sustained — it
-   almost always means a forwarder's clock has drifted or a source is
-   replaying an old file, not "some benign amount of expected lateness."
-3. The two `KeyedProcessFunction` detectors (beaconing, DNS tunneling)
-   don't use Flink's window API at all — they manage their own state and
-   event-time timers directly. For them, "late" just means: if an event's
-   timestamp is older than data already folded into the running
-   mean/stddev, it still gets included (nothing here discards based on
-   arrival order within a key), but the *timer* that closes a DNS-tunneling
-   tumbling window or expires an idle beaconing buffer fires based on
-   watermark progress, not on wall-clock time — so a burst of delayed
-   events can't accidentally close a window early, but a genuinely stalled
-   partition (caught by the idleness setting above) won't hang it open
-   forever either.
-
-
-   detector algorithms** (`tools/local_pipeline_smoke_test.py` — new in this
-pass, and a genuinely useful addition on its own: a fast way to validate
-parsing/detection logic and the ClickHouse schema without spinning up a
-JVM or a Kafka cluster), ran it against ~176k freshly-generated synthetic
-log lines from the Go load generator, and loaded the real output into a
-real, running ClickHouse instance.
-
-![Real ClickHouse output from the local smoke test](docs/smoke_test_results.png)
-*Real `SELECT` output from a real ClickHouse instance, loaded by actually
-running the detector logic against actually-generated synthetic logs. Not
-a Flink/Kafka screenshot — see below for why, and `docs/smoke_test_results.png`
-is reproducible by running `tools/local_pipeline_smoke_test.py` yourself.*
-
-**This surfaced three real, non-obvious findings** — exactly the kind of
-thing that only shows up when you actually run something instead of just
-reading the code:
-
-1. **A real bug**: the first version of the smoke-test's ClickHouse insert
-   path built one giant `INSERT ... VALUES (...),(...),...` string and
-   passed it via `argv`. At ~176k rows that blew past the OS's `ARG_MAX`
-   (`OSError: Argument list too long`). Fixed by batching inserts (2,000
-   rows/statement) and piping through stdin instead of argv — a good
-   reminder that "batch your writes" isn't just a ClickHouse performance
-   tip, it's sometimes a hard requirement.
-2. **A real threshold-tuning problem**: at 800 events/sec with the load
-   generator's baseline ~8% synthetic SSH failure rate, `failed_login_rate`
-   fired on **every single benign host**, with 500+ "failed logins" per
-   5-minute window against a threshold of 10. The detector logic is
-   correct — the threshold (10/5min) was simply calibrated for a much
-   lower-traffic, lower-baseline-failure environment than this synthetic
-   dataset produces. This is left in the results image on purpose rather
-   than tuned away: it's a realistic lesson that rate thresholds need to
-   be calibrated against your actual population's baseline failure rate
-   and traffic volume, not picked arbitrarily — the same trap a first
-   deployment of this exact detector would fall into against real traffic.
-3. **A real near-miss on DNS tunneling, then a real fix**: with the
-   default `--z-score-threshold 2.0`, the planted tunneling source's mean
-   entropy (3.18 bits/char) fell *just* under the computed alert threshold
-   (3.23 bits/char) — zero alerts. Root cause: 32-character hex-encoded
-   labels empirically top out around ~3.2-3.3 bits/char in practice, below
-   the 4-bit theoretical maximum for a 16-symbol alphabet (finite-sample
-   entropy estimation bias on a 32-character string). Retrained with
-   `--z-score-threshold 1.5` and it fired cleanly across all 4 windows,
-   with zero false positives on any other source. Both runs are real;
-   neither number was chosen to make the demo look good after the fact —
-   the first (failed) run is what motivated retraining with the second
-   threshold.
-
-## Exactly-once semantics — what's actually guaranteed here, and what isn't
-
-`env.enableCheckpointing(30_000, CheckpointingMode.EXACTLY_ONCE)` gives you
-exactly-once **within Flink's own state and against the Kafka source**:
-Kafka source offsets and every operator's internal state (the beaconing
-timestamp buffers, the DNS entropy accumulators, window contents) are
-committed together atomically on each checkpoint barrier. If a task manager
-crashes, Flink restores from the last checkpoint and resumes from exactly
-the offsets that checkpoint captured — no event is processed twice *from
-Flink's internal perspective*, and none is skipped.
-
-That guarantee does **not** automatically extend to the sinks, and this job
-is honest about where it stops:
-- **Kafka alert sink**: uses `KafkaSink` in its default (at-least-once)
-  delivery mode here, not Flink's two-phase-commit `EXACTLY_ONCE` Kafka
-  sink mode. Upgrading to true exactly-once delivery into
-  `siem.alerts` would mean setting Kafka transactional delivery guarantees
-  on the sink and accepting the operational cost of transactional
-  producers (a `transactional.id`, longer end-to-end latency from the
-  2PC protocol, and broker-side transaction coordinator load) — a real
-  trade-off, not a free upgrade, and arguably not worth it for an
-  idempotent-by-nature alert stream where a duplicate alert is a nuisance,
-  not a correctness bug.
-- **ClickHouse JDBC sink**: at-least-once. A task restart after a
-  checkpoint but before its buffered batch fully committed can replay and
-  duplicate rows on reconnect. Closing that gap for real would mean either
-  (a) giving `siem.alerts`/`siem.enriched_events` a `ReplacingMergeTree`
-  engine keyed on a natural dedup key (e.g. hash of `raw` + `event_time` +
-  `source_ip`) so replays collapse away on merge, or (b) a proper
-  two-phase-commit sink that stages rows and only makes them visible after
-  the Flink checkpoint that produced them is confirmed complete. Neither is
-  implemented here — the schema as written optimizes for query performance
-  and simplicity over deduplication, which is the right trade-off for a
-  security-alerting system where an analyst seeing the same alert twice is
-  far cheaper than the added write-path complexity and latency of a 2PC
-  sink.
-
-The honest summary: **Flink's own recovery is exactly-once; the two
-external sinks are at-least-once.** That's a normal, common place to land
-for a system where write-once accounting correctness (think: billing)
-isn't the point — for security alerting, "resilient and eventually
-consistent, occasionally duplicated" beats "exactly-once but fragile."
-
-## Detector design notes
-
-- **Failed-login rate**: `TumblingEventTimeWindows.of(Time.minutes(5))`,
-  keyed by source IP. Tumbling (not sliding) because a rate count doesn't
-  need overlapping re-evaluation — that's useful for smoothing beaconing
-  detection, wasteful here.
-- **Beaconing**: `KeyedProcessFunction` keyed by `sourceIp|destIp`, holding
-  a bounded FIFO of the last N event timestamps per channel in
-  `ValueState`. Flags a channel when the *coefficient of variation*
-  (stddev/mean) of inter-arrival intervals drops below a threshold — the
-  signal is regularity, not any particular interval length, since C2
-  beacon intervals vary by malware family and jitter config. An event-time
-  timer re-registered on every new event expires (clears) the state for a
-  channel that's gone quiet for 15 minutes, so this doesn't leak memory
-  over a long-running job watching many source/dest pairs.
-- **DNS tunneling**: `KeyedProcessFunction` keyed by source IP, keeping
-  only running sums (count, Σentropy, Σentropy²) rather than buffering
-  every query — O(1) state size per key regardless of query volume, which
-  matters because DNS volume per host usually dwarfs firewall-connection
-  volume. Scores the window's mean subdomain entropy as a z-score against
-  an **offline-trained baseline** (median + MAD-based robust stddev, chosen
-  specifically because a plain mean/stddev baseline is easily dragged
-  upward — and blinded — by even a small amount of contamination in the
-  "assumed benign" training corpus; see `ml-model/train_dns_entropy_model.py`).
-
-## Repo layout
-
-```
-go-forwarder/         Log shipper + synthetic load generator (Go)
-flink-job/             The stream processing job (Java, Maven)
-clickhouse/            Schema + sample analyst queries
-ml-model/              Offline entropy-baseline trainer (Python, stdlib only)
-docker-compose.yml     Full local stack
+```bash
+python3 tools/local_pipeline_smoke_test.py \
+  --auth-log ./synthetic-logs/auth.log \
+  --dns-log ./synthetic-logs/dns.log \
+  --firewall-log ./synthetic-logs/firewall.log \
+  --model-params ./ml-model/model_params.json \
+  --clickhouse-insert
 ```
 
-## Known gaps / next steps if you keep going
-- The auth-log year-inference gotcha noted in `AuthLogParser.java` (RFC3164
-  timestamps carry no year) is real; switch upstream log sources to RFC5424
-  or stamp lines with an ingest-time year at the forwarder if you deploy
-  this near a year boundary.
-- No schema registry — the raw envelope and alert JSON are hand-maintained
-  in parallel between Go and Java. Fine at this scale; worth Avro/Protobuf +
-  a registry before this becomes a shared platform with more producers.
-- `required_acks: 1` in the Go forwarder's default config is leader-only
-  acknowledgment. Set it to `-1` (all in-sync replicas) for
-  compliance-sensitive sources once you're running Kafka with a real
-  replication factor (the docker-compose here is a single-node dev setup).
+The smoke test intentionally mirrors the Java parser and detector logic, but it is **not a replacement for the distributed Flink job**. It does not prove correctness under Kafka partitioning, real watermark progression, task failures, checkpoint recovery, or concurrent execution.
+
+---
+
+## DNS baseline training
+
+The Python model trainer creates the baseline consumed by the Java DNS detector.
+
+```bash
+python3 ml-model/train_dns_entropy_model.py \
+  --input ./synthetic-logs/dns.log \
+  --output ./ml-model/model_params.json
+```
+
+Optional tuning parameters include:
+
+```bash
+--z-score-threshold
+--min-queries-per-window
+--window-size-ms
+```
+
+The generated JSON is intentionally compatible with `DnsTunnelingModelParams` in the Flink job.
+
+For the synthetic dataset used with this project, the DNS detector required threshold calibration because short hexadecimal labels have a practical entropy ceiling below their theoretical alphabet maximum. The included smoke-test output documents that tuning process rather than hiding the initial false negative.
+
+---
+
+## Go forwarder
+
+The forwarder supports:
+
+- file tailing
+- syslog UDP ingestion
+- batching
+- Kafka delivery
+- compression
+- configurable retries
+- Prometheus-style metrics
+- bounded buffering/backpressure
+
+Configuration example:
+
+```yaml
+node_id: forwarder-01
+
+kafka:
+  brokers:
+    - kafka:9092
+  topic: siem.raw.events
+  batch_size: 500
+  batch_timeout: 1s
+  compression: snappy
+  required_acks: 1
+  max_retries: 5
+```
+
+For higher durability requirements on a replicated Kafka cluster, configure acknowledgements appropriately for the deployment rather than using the single-node development defaults.
+
+---
+
+## Project structure
+
+```
+.
+├── clickhouse/
+│   ├── schema.sql
+│   ├── schema.local-smoke-test.sql
+│   └── sample_queries.sql
+│
+├── flink-job/
+│   ├── pom.xml
+│   └── src/
+│       ├── main/java/com/siem/
+│       │   ├── functions/     # Detection operators
+│       │   ├── jobs/          # Flink entry point
+│       │   ├── model/         # Event, alert and model types
+│       │   ├── parse/         # Source parsers
+│       │   └── sink/          # Kafka and ClickHouse sinks
+│       └── test/
+│
+├── go-forwarder/
+│   ├── cmd/
+│   │   ├── forwarder/         # Log shipper
+│   │   └── loadgen/           # Synthetic telemetry generator
+│   ├── internal/
+│   │   ├── config/
+│   │   ├── metrics/
+│   │   ├── sink/
+│   │   └── source/
+│   └── config.example.yaml
+│
+├── ml-model/
+│   ├── train_dns_entropy_model.py
+│   └── requirements.txt
+│
+├── tools/
+│   ├── local_pipeline_smoke_test.py
+│   └── render_smoke_test_results.py
+│
+├── docs/
+│   └── smoke_test_results.png
+│
+└── docker-compose.yml
+```
+
+---
+
+## Testing
+
+The Flink project includes unit tests for the stateful detection components, including:
+
+- beaconing detection
+- entropy calculations
+
+Run them with:
+
+```bash
+cd flink-job
+mvn test
+```
+
+The repository also provides the local smoke test for rapid parser/detector/schema validation.
+
+For a full system validation, use Docker Compose and exercise the complete:
+
+```
+load generator
+    -> Go forwarder
+    -> Kafka
+    -> Flink
+    -> ClickHouse + Kafka alerts
+```
+
+---
+
+## Configuration
+
+The Flink job exposes runtime parameters for the main detection controls.
+
+Examples:
+
+```
+--kafka-brokers
+--raw-topic
+--alert-topic
+--dead-letter-topic
+--consumer-group
+
+--failed-login-threshold
+
+--beacon-max-samples
+--beacon-min-samples
+--beacon-max-cv
+--beacon-min-interval-ms
+--beacon-max-interval-ms
+
+--dns-model-path
+```
+
+The defaults are intended for the included development environment. Detection thresholds should be calibrated against the actual baseline of the environment being monitored.
+
+---
+
+## Operational considerations
+
+This repository is a development and research implementation rather than a turnkey production deployment.
+
+Before production use, review at least:
+
+- Kafka replication and acknowledgement settings
+- TLS and authentication for Kafka
+- ClickHouse authentication and network exposure
+- Flink checkpoint storage durability
+- sink idempotency/deduplication
+- schema/version management
+- log timestamp normalization
+- DNS model training data quality
+- detector thresholds and false-positive rates
+- dead-letter queue monitoring
+- secrets management
+- retention and compliance requirements
+
+The Docker Compose configuration intentionally uses a single Kafka broker and development-oriented settings.
+
+---
+
+## Security model and scope
+
+The synthetic traffic in this repository is designed for defensive testing of the detection pipeline.
+
+The project demonstrates **behavioral detection** rather than reputation-based blocking. In particular, a destination IP alone is not treated as malicious. The detectors look for patterns such as:
+
+- repeated authentication failures
+- periodic outbound connections
+- anomalously high DNS label entropy
+
+This distinction is important when interpreting the synthetic data: the reserved addresses used by the load generator are test infrastructure, not indicators of compromise.
+
+---
+
+## License
+
+See [LICENSE](LICENSE).
