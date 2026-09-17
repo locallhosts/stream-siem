@@ -1,0 +1,5 @@
+# train_dns_entropy_model.py uses only the Python standard library
+# (argparse, json, math, re, collections) — no third-party dependencies.
+# This file is kept as a placeholder in case you extend the model (e.g.
+# swapping the entropy baseline for a proper density estimate with scipy,
+# or adding a notebook for exploration with pandas/matplotlib).

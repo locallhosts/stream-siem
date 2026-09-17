@@ -1,0 +1,31 @@
+node_id: forwarder-docker-01
+
+kafka:
+  brokers:
+    - kafka:29092
+  topic: siem.raw.events
+  batch_size: 500
+  batch_timeout: 1s
+  compression: snappy
+  required_acks: 1
+  max_retries: 5
+
+metrics:
+  enabled: true
+  addr: "0.0.0.0:9109"
+
+sources:
+  - type: file
+    source_type: auth
+    path: /var/log/siem/auth.log
+    from_beginning: true
+
+  - type: file
+    source_type: dns
+    path: /var/log/siem/dns.log
+    from_beginning: true
+
+  - type: file
+    source_type: firewall
+    path: /var/log/siem/firewall.log
+    from_beginning: true

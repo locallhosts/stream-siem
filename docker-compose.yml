@@ -1,0 +1,153 @@
+# Real-Time Stream Processing SIEM — full local stack.
+#
+# Bring it up:            docker compose up -d
+# Watch alerts flow:      docker compose logs -f flink-jobmanager | grep ALERT
+# Generate synthetic load: docker compose --profile loadgen up loadgen
+# Submit the Flink job:   see README.md — it's submitted from flink-jobmanager
+#                          once the fat jar is built with `mvn package`.
+#
+# Topology: loadgen/forwarder -> Kafka (siem.raw.events) -> Flink -> {
+#   ClickHouse (siem.enriched_events, siem.alerts),
+#   Kafka (siem.alerts topic)
+# }
+
+services:
+  kafka:
+    image: apache/kafka:3.7.1
+    container_name: siem-kafka
+    ports:
+      - "9092:9092"        # broker, for host-side tools/tests
+      - "9093:9093"        # controller (KRaft), internal
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Single-node dev settings; raise replication factors before running
+      # against anything you'd call "production."
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      CLUSTER_ID: siem-dev-cluster-1
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  kafka-init-topics:
+    image: apache/kafka:3.7.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic siem.raw.events        --partitions 6 --replication-factor 1 --config compression.type=snappy &&
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic siem.alerts           --partitions 3 --replication-factor 1 &&
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic siem.dead-letters     --partitions 1 --replication-factor 1 &&
+      echo 'topics ready' &&
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --list
+      "
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: siem-clickhouse
+    ports:
+      - "8123:8123"   # HTTP interface (used by the Flink JDBC sink and CLI clients)
+      - "9000:9000"   # native protocol
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  flink-jobmanager:
+    image: flink:1.19.1-java17
+    container_name: siem-flink-jobmanager
+    command: jobmanager
+    ports:
+      - "8081:8081"   # Flink Web UI — watch checkpoints, backpressure, watermarks per operator
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        state.backend: rocksdb
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+        state.backend.incremental: true
+        execution.checkpointing.interval: 30s
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
+      - ./flink-job/target:/opt/flink/usrlib   # mount the built fat jar here after `mvn package`
+      - ./ml-model:/opt/flink/ml-model:ro       # trained DNS-tunneling model JSON, if you've run the trainer
+    depends_on:
+      kafka:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+
+  flink-taskmanager:
+    image: flink:1.19.1-java17
+    container_name: siem-flink-taskmanager
+    command: taskmanager
+    scale: 2
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        state.backend: rocksdb
+        state.checkpoints.dir: file:///opt/flink/checkpoints
+    volumes:
+      - flink-checkpoints:/opt/flink/checkpoints
+    depends_on:
+      - flink-jobmanager
+
+  forwarder:
+    build:
+      context: ./go-forwarder
+      dockerfile: Dockerfile
+    container_name: siem-forwarder
+    command: ["-config", "/etc/siem-forwarder/config.docker.yaml"]
+    volumes:
+      - ./go-forwarder/config.docker.yaml:/etc/siem-forwarder/config.docker.yaml:ro
+      - synthetic-logs:/var/log/siem
+    ports:
+      - "9109:9109"   # Prometheus metrics
+    depends_on:
+      kafka-init-topics:
+        condition: service_completed_successfully
+
+  # Not started by default: `docker compose --profile loadgen up loadgen`.
+  # Writes synthetic auth/dns/firewall logs (with planted beaconing + DNS
+  # tunneling) into the same volume the forwarder tails, so you can watch
+  # alerts appear end-to-end without needing real log sources.
+  loadgen:
+    build:
+      context: ./go-forwarder
+      dockerfile: Dockerfile.loadgen
+    container_name: siem-loadgen
+    profiles: ["loadgen"]
+    command: ["-rate", "2000", "-duration", "30m", "-out-dir", "/var/log/siem"]
+    volumes:
+      - synthetic-logs:/var/log/siem
+
+volumes:
+  kafka-data:
+  clickhouse-data:
+  flink-checkpoints:
+  synthetic-logs:
