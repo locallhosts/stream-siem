@@ -1,4 +1,4 @@
-module github.com/yourorg/siem-forwarder
+module github.com/locallhosts/siem-forwarder
 
 go 1.22
 

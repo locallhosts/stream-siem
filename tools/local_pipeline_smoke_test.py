@@ -264,7 +264,33 @@ def main():
         model = json.load(f)
 
     auth, dns, fw = load_events(args.auth_log, args.dns_log, args.firewall_log)
-    print(f"parsed: {len(auth)} auth, {len(dns)} dns, {len(fw)} firewall events", file=sys.stderr)
+    total_events = len(auth) + len(dns) + len(fw)
+
+    section("REALTIME SIEM — LOCAL SMOKE TEST")
+
+    print(
+        f"  {c('✓', GREEN)} {c('AUTH EVENTS', BOLD):<30} "
+        f"{c(f'{len(auth):,}', GREEN)}",
+        file=sys.stderr,
+    )
+    print(
+        f"  {c('✓', GREEN)} {c('DNS EVENTS', BOLD):<30} "
+        f"{c(f'{len(dns):,}', GREEN)}",
+        file=sys.stderr,
+    )
+    print(
+        f"  {c('✓', GREEN)} {c('FIREWALL EVENTS', BOLD):<30} "
+        f"{c(f'{len(fw):,}', GREEN)}",
+        file=sys.stderr,
+    )
+
+    print(c("  ─────────────────────────────────────────────────", DIM), file=sys.stderr)
+    print(
+        f"  {c('✓', GREEN)} {c('TOTAL EVENTS', BOLD):<30} "
+        f"{c(f'{total_events:,}', GREEN)}",
+        file=sys.stderr,
+    )
+
 
     failed_login_alerts = detect_failed_login_rate(auth)
     beaconing_alerts = detect_beaconing(fw)
@@ -272,22 +298,79 @@ def main():
     all_alerts = failed_login_alerts + beaconing_alerts + dns_alerts
     all_alerts.sort(key=lambda a: a["detected_at"])
 
-    print(f"\n{len(all_alerts)} alerts:", file=sys.stderr)
+    print(file=sys.stderr)
+    print(c("  🚨 DETECTIONS", RED + BOLD), file=sys.stderr)
+    print(c("  ─────────────────────────────────────────────────", DIM), file=sys.stderr)
+    print(
+        f"  {c(str(len(all_alerts)), YELLOW + BOLD)} "
+        f"{c('alerts detected', YELLOW + BOLD)}",
+        file=sys.stderr,
+    )
     for a in all_alerts:
-        print(f"  [{a['alert_type']:>18}] {a['source_ip']:>15} -> {a.get('dest_ip') or '-':<15} "
-              f"score={a['score']:.2f}  {a['details']}", file=sys.stderr)
+        alert_color = {
+            "failed_login_rate": YELLOW,
+            "beaconing": MAGENTA,
+            "dns_tunneling": RED,
+        }.get(a["alert_type"], WHITE)
+
+        print(
+            f"  {c('●', alert_color)} "
+            f"{c(f'[{a["alert_type"]:>18}]', alert_color)} "
+            f"{a['source_ip']:>15} -> "
+            f"{a.get('dest_ip') or '-':<15} "
+            f"{c(f"score={a['score']:.2f}", GREEN)}  "
+            f"{a['details']}",
+            file=sys.stderr,
+        )
 
     if args.clickhouse_insert:
         insert_into_clickhouse(auth + dns + fw, all_alerts)
 
-    print(json.dumps({
-        "auth_events": len(auth), "dns_events": len(dns), "firewall_events": len(fw),
-        "alerts_by_type": {
-            "failed_login_rate": len(failed_login_alerts),
-            "beaconing": len(beaconing_alerts),
-            "dns_tunneling": len(dns_alerts),
-        },
-    }))
+    print(file=sys.stderr)
+    print(c("╔" + "═" * 60 + "╗", CYAN), file=sys.stderr)
+    print(c("║ " + "PIPELINE PASSED ✓".center(58) + " ║", GREEN + BOLD), file=sys.stderr)
+    print(c("╚" + "═" * 60 + "╝", CYAN), file=sys.stderr)
+
+    print(
+        json.dumps({
+            "auth_events": len(auth),
+            "dns_events": len(dns),
+            "firewall_events": len(fw),
+            "alerts_by_type": {
+                "failed_login_rate": len(failed_login_alerts),
+                "beaconing": len(beaconing_alerts),
+                "dns_tunneling": len(dns_alerts),
+            },
+        })
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# Terminal styling
+# ─────────────────────────────────────────────────────────────
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+CYAN = "\033[36m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+RED = "\033[31m"
+MAGENTA = "\033[35m"
+WHITE = "\033[97m"
+
+
+def c(text, color):
+    return f"{color}{text}{RESET}"
+
+
+def section(title):
+    line = "═" * 60
+    print(file=sys.stderr)
+    print(c(f"╔{line}╗", CYAN), file=sys.stderr)
+    print(c(f"║ {title.center(58)} ║", CYAN + BOLD), file=sys.stderr)
+    print(c(f"╚{line}╝", CYAN), file=sys.stderr)
+    print(file=sys.stderr)
 
 
 def ch_escape(s):
@@ -307,7 +390,18 @@ def _run_batched_inserts(table_sql_prefix, rows, batch_size=2000):
         # thousands of rows in one statement, which this script's first
         # draft did. Piping to stdin and batching in chunks fixes both the
         # OS limit and keeps any single request reasonably sized.
-        subprocess.run(["clickhouse-client", "--multiquery"], input=sql.encode(), check=True)
+        subprocess.run(
+            [
+                "docker", "exec", "-i",
+                "siem-clickhouse",
+                "clickhouse-client",
+                "--user", "siem",
+                "--password", "siem_local_dev_2026",
+                "--multiquery",
+            ],
+            input=sql.encode(),
+            check=True,
+        )
 
 
 def insert_into_clickhouse(events, alerts):

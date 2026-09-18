@@ -41,15 +41,35 @@ public class SiemStreamJob {
     public static void main(String[] args) throws Exception {
         ParameterTool params = ParameterTool.fromArgs(args);
 
-        String kafkaBrokers = params.get("kafka-brokers", "kafka:9092");
+        String kafkaBrokers = params.get("kafka-brokers", "kafka:29092");
         String rawTopic = params.get("raw-topic", "siem.raw.events");
         String alertTopic = params.get("alert-topic", "siem.alerts");
         String deadLetterTopic = params.get("dead-letter-topic", "siem.dead-letters");
         String consumerGroup = params.get("consumer-group", "siem-flink-job");
 
-        String clickhouseUrl = params.get("clickhouse-url", "jdbc:ch://clickhouse:8123/siem");
-        String clickhouseUser = params.get("clickhouse-user", "default");
-        String clickhousePassword = params.get("clickhouse-password", "");
+        String clickhouseUrl = params.get(
+        "clickhouse-url",
+        System.getenv().getOrDefault(
+                "CLICKHOUSE_URL",
+                "jdbc:ch://clickhouse:8123/siem"
+        )
+        );
+
+        String clickhouseUser = params.get(
+                "clickhouse-user",
+                System.getenv().getOrDefault(
+                        "CLICKHOUSE_USER",
+                        "default"
+                )
+        );
+
+        String clickhousePassword = params.get(
+                "clickhouse-password",
+                System.getenv().getOrDefault(
+                        "CLICKHOUSE_PASSWORD",
+                        ""
+                )
+        );
 
         // Failed-login-rate thresholds
         int failedLoginThreshold = params.getInt("failed-login-threshold", 10);

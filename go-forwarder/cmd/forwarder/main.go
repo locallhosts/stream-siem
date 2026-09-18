@@ -15,10 +15,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/yourorg/siem-forwarder/internal/config"
-	"github.com/yourorg/siem-forwarder/internal/metrics"
-	"github.com/yourorg/siem-forwarder/internal/sink"
-	"github.com/yourorg/siem-forwarder/internal/source"
+	"github.com/locallhosts/siem-forwarder/internal/config"
+	"github.com/locallhosts/siem-forwarder/internal/metrics"
+	"github.com/locallhosts/siem-forwarder/internal/sink"
+	"github.com/locallhosts/siem-forwarder/internal/source"
 )
 
 func main() {

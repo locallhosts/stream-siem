@@ -10,8 +10,8 @@ import (
 	"github.com/segmentio/kafka-go"
 	"github.com/segmentio/kafka-go/compress"
 
-	"github.com/yourorg/siem-forwarder/internal/metrics"
-	"github.com/yourorg/siem-forwarder/internal/source"
+	"github.com/locallhosts/siem-forwarder/internal/metrics"
+	"github.com/locallhosts/siem-forwarder/internal/source"
 )
 
 type KafkaSinkConfig struct {
