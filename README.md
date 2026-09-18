@@ -4,7 +4,7 @@ A real-time security telemetry pipeline built around **Go, Apache Kafka, Apache 
 
 The project ingests authentication, DNS, and firewall telemetry; parses it into a common event model; applies stateful, event-time detection; persists enriched events and alerts in ClickHouse; and republishes alerts to Kafka for downstream automation.
 
-![Stream SIEM smoke-test output](docs/smoke_test_results.png)
+![Stream SIEM smoke-test output](docs/images/smoke_test_results.png)
 
 > The screenshot above is from the repository's local smoke test: detector logic was run against generated telemetry and the resulting events and alerts were inserted into a running ClickHouse instance. The load generator uses reserved documentation IP ranges for simulated external destinations.
 
