@@ -397,6 +397,38 @@ The test suite includes stateful detection tests such as:
 - regular 30-second beaconing traffic
 - irregular traffic that should remain silent
 - event-time/watermark driven operator behavior
+## Flink runtime verification
+
+The distributed Flink job has also been verified locally after aligning the Jackson runtime dependencies used by the application and Flink cluster. The Maven build explicitly keeps the Jackson core modules on the same version:
+
+```
+jackson-databind    2.17.1
+jackson-core        2.17.1
+jackson-annotations 2.17.1
+jackson-datatype-jsr310 2.17.1
+```
+
+This avoids the runtime `NoSuchMethodError` caused by an incompatible Jackson core/databind combination in the shaded job.
+
+A verified local JobManager state showed:
+
+| Check | Result |
+|---|---:|
+| Flink job state | **RUNNING** |
+| Running tasks | **7 / 7** |
+| Failed tasks | **0** |
+| Canceled tasks | **0** |
+
+Verification screenshots are stored in `docs/images/`:
+
+- `flink-ui.png` — Flink Web UI showing the running distributed job
+- `terminal-verifed.png` — terminal verification of the local pipeline
+
+The Flink REST check used for the verification is:
+
+```bash
+curl -s http://localhost:8081/jobs/overview | python3 -m json.tool
+```
 
 ---
 
@@ -966,7 +998,9 @@ The filename is historical; the workflow itself now uses Maven rather than Gradl
 ├── docs/
 │   └── images/
 │       ├── smoke-test-results.png
-│       └── smoke-test-results-full.png
+│       ├── smoke-test-results-full.png
+│       ├── flink-ui.png
+│       └── terminal-verifed.png
 │
 └── docker-compose.yml
 ```
