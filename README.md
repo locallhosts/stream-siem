@@ -421,8 +421,8 @@ A verified local JobManager state showed:
 
 Verification screenshots are stored in `docs/images/`:
 
-- `flink-ui.png` — Flink Web UI showing the running distributed job
-- `terminal-verifed.png` — terminal verification of the local pipeline
+- [**flink-ui.png**](docs/images/flink-ui.png) — Flink Web UI showing the running distributed job
+- [**terminal-verifed.png**](docs/images/terminal-verifed.png) — terminal verification of the local pipeline
 
 The Flink REST check used for the verification is:
 
