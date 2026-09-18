@@ -1,67 +1,66 @@
 # Stream SIEM
 
-A real-time security telemetry pipeline built around **Go, Apache Kafka, Apache Flink, ClickHouse, and Python**.
+A real-time security telemetry pipeline built around **Go, Apache Kafka, Apache Flink, ClickHouse, Java, and Python**.
 
-The project ingests authentication, DNS, and firewall telemetry; parses it into a common event model; applies stateful, event-time detection; persists enriched events and alerts in ClickHouse; and republishes alerts to Kafka for downstream automation.
+The project ingests authentication, DNS, and firewall telemetry; normalizes it into a common event model; applies stateful event-time detection; persists enriched events and alerts in ClickHouse; and republishes alerts to Kafka.
 
-![Stream SIEM smoke-test output](docs/images/smoke_test_results.png)
+![Stream SIEM local verification](docs/images/smoke-test-results.png)
 
-> The screenshot above is from the repository's local smoke test: detector logic was run against generated telemetry and the resulting events and alerts were inserted into a running ClickHouse instance. The load generator uses reserved documentation IP ranges for simulated external destinations.
-
----
-
-## Architecture
-
-```
-                    Synthetic logs / real log sources
-                                  |
-                                  v
-                         +----------------+
-                         | Go Forwarder   |
-                         | file + syslog  |
-                         +-------+--------+
-                                 |
-                                 v
-                    +-------------------------+
-                    | Apache Kafka             |
-                    | siem.raw.events          |
-                    +------------+--------------+
-                                 |
-                                 v
-                    +-------------------------+
-                    | Apache Flink             |
-                    | event-time processing    |
-                    | parsing + detection      |
-                    +------------+--------------+
-                                 |
-                  +--------------+---------------+
-                  |                              |
-                  v                              v
-        +-------------------+          +-------------------+
-        | ClickHouse        |          | Kafka             |
-        | enriched_events   |          | siem.alerts       |
-        | alerts             |          | dead letters      |
-        +-------------------+          +-------------------+
-```
-
-### Detection pipeline
-
-The Flink job uses the timestamp contained in each log event rather than ingestion time.
-
-1. Kafka provides raw envelopes.
-2. Flink parses the source-specific log format.
-3. Invalid JSON, unknown source types, and parse failures are sent to a dead-letter topic.
-4. Parsed events receive event-time timestamps.
-5. Bounded-out-of-orderness watermarks handle out-of-order delivery.
-6. Stateful detectors evaluate authentication, firewall, and DNS behavior.
-7. Alerts are written to ClickHouse and published to Kafka.
-8. Late authentication events that exceed the configured allowed lateness are routed to a dedicated dead-letter stream.
+> The image above is a reproducible local verification artifact generated from real detector output and ClickHouse data. It is not a mock dashboard.
 
 ---
 
-## Detection capabilities
+## What this project demonstrates
 
-### Failed-login rate
+This repository is intentionally built as an end-to-end security engineering project rather than a collection of isolated components.
+
+```
+Synthetic telemetry
+       |
+       v
+   Go Loadgen
+       |
+       v
+  Go Forwarder
+       |
+       v
+Apache Kafka
+siem.raw.events
+       |
+       v
+ Apache Flink
+       |
+       +-------------------+
+       |                   |
+       v                   v
+  ClickHouse          Kafka alerts
+ enriched_events      siem.alerts
+ alerts               dead letters
+       |
+       v
+ Detection / analytics / Web UI
+```
+
+The local validation path has been exercised across:
+
+- Docker Compose infrastructure
+- Go forwarder and synthetic load generator
+- Kafka topics and offsets
+- Java/Flink unit tests
+- Maven packaging
+- Flink event-time processing
+- checkpoint completion
+- ClickHouse persistence
+- Python parser/detector smoke testing
+- ClickHouse schema validation
+- README verification rendering
+- GitHub Actions CI for Java, Go, Python, and Compose configuration
+
+---
+
+# Detection capabilities
+
+## Failed-login rate
 
 Detects repeated authentication failures from a source IP using a **5-minute tumbling event-time window**.
 
@@ -69,11 +68,9 @@ Detects repeated authentication failures from a source IP using a **5-minute tum
 - Default threshold: 10 failed logins
 - Event-time processing
 - Configurable threshold
-- Alert score increases with the observed failure count
+- Alert score based on observed failure count
 
-This detector is intended to identify brute-force-style authentication activity while keeping the implementation inexpensive for high-volume authentication streams.
-
-### Beaconing
+## Beaconing
 
 Detects repeated outbound connections whose inter-arrival times are unusually regular.
 
@@ -82,62 +79,67 @@ The detector:
 - keys state by `sourceIp|destIp`
 - keeps a bounded timestamp buffer
 - calculates inter-arrival intervals
-- calculates the coefficient of variation (CV)
+- calculates coefficient of variation (CV)
 - requires a minimum number of observations
-- constrains the average interval to a configurable range
-- expires inactive state after 15 minutes
-- applies a cooldown so an established beacon does not generate an alert on every event
+- constrains the average interval
+- expires inactive state
+- applies an alert cooldown
 
-The important signal is **regularity**, not a specific destination or fixed interval. This makes the detector useful for identifying periodic callback behavior with jitter.
+Default development settings include:
 
-### DNS tunneling
+```
+max samples:       20
+minimum samples:    5
+maximum CV:       0.15
+minimum interval:  5 seconds
+maximum interval:  1 hour
+idle expiry:       15 minutes
+```
+
+The signal is periodic behavior rather than a hard-coded malicious destination.
+
+## DNS tunneling
 
 Detects DNS activity whose subdomain entropy is statistically unusual relative to an offline-trained baseline.
 
-The streaming detector:
+The detector:
 
 - keys state by source IP
-- calculates Shannon entropy for query labels
-- maintains running count, sum, and sum-of-squares
-- uses O(1) state per source IP
+- calculates Shannon entropy
+- maintains running statistics
 - evaluates a configurable tumbling window
 - calculates a z-score against the trained baseline
-- emits an alert when the z-score exceeds the configured threshold
+- emits an alert when the configured threshold is exceeded
 
-The baseline trainer in `ml-model/` uses a **median + MAD-based robust scale estimate**, which reduces the influence of contaminated training data.
+The Python baseline trainer uses a median/MAD-based robust scale estimate.
 
 ---
 
-## Event-time and late-data handling
+# Event-time processing
 
-The pipeline is deliberately event-time based.
-
-For DNS and firewall logs, timestamps are parsed directly from the RFC3339 event timestamp. Authentication logs use the traditional RFC3164-style timestamp and therefore require a year to be inferred.
-
-Flink uses:
+The Flink pipeline is deliberately event-time based.
 
 - **30-second bounded out-of-orderness**
 - **2-minute source idleness detection**
-- **30-second allowed lateness for the failed-login window**
-- a dead-letter side output for authentication events that arrive after the allowed-lateness boundary
+- **30-second allowed lateness for failed-login windows**
+- authentication late-data dead-letter handling
+- stateful detector operators
+- RocksDB state backend
+- incremental checkpoints
 
-This means a delayed event is not automatically treated as a new real-time event. Window behavior is driven by the event timestamp and watermark progression.
-
-> **RFC3164 limitation:** traditional syslog authentication timestamps do not contain a year. The current parser uses the current UTC year. Deployments that replay logs across a year boundary should use a source with an explicit year (for example RFC5424) or normalize the timestamp upstream.
+Authentication records use RFC3164-style timestamps, which do not contain a year. The current parser infers the current UTC year. Long-term replay across a year boundary should use timestamps containing an explicit year or normalize them upstream.
 
 ---
 
-## Delivery and recovery semantics
+# Delivery and recovery semantics
 
-Flink checkpointing is configured for **exactly-once state consistency**:
+Flink checkpointing is configured for exactly-once state consistency:
 
 ```java
 env.enableCheckpointing(30_000, CheckpointingMode.EXACTLY_ONCE);
 ```
 
-This protects Flink's managed state and Kafka source offsets during recovery.
-
-The external sinks currently have different guarantees:
+The current external sink semantics are:
 
 | Component | Current behavior |
 |---|---|
@@ -145,119 +147,262 @@ The external sinks currently have different guarantees:
 | Kafka alert sink | At-least-once |
 | ClickHouse JDBC sink | At-least-once |
 
-A task restart can therefore replay a sink batch. The current ClickHouse schema uses `MergeTree`; it does not implement sink-level deduplication.
-
-For a deployment that requires stronger end-to-end guarantees, the write path would need an explicit idempotency/deduplication strategy or transactional sink design.
+A task restart can replay a sink batch. The current ClickHouse MergeTree schema does not provide sink-level deduplication.
 
 ---
 
-## Data model
+# Local environment
 
-### Parsed event types
+The development stack uses:
 
-The current parsers support:
-
-| Source | Example data |
+| Component | Version / runtime |
 |---|---|
-| `auth` | SSH accepted/failed authentication |
-| `dns` | DNS query and source IP |
-| `firewall` | ALLOW/DENY, protocol, source, destination, port |
+| Java | 17 |
+| Maven | 3.x |
+| Go | 1.25.x |
+| Python | 3.x |
+| Kafka | 3.7.1 |
+| Flink | 1.19.1 Java 17 |
+| ClickHouse | 24.8 |
+| Docker Compose | v2.x |
 
-All sources are normalized into the shared `ParsedEvent` model before detection.
+The repository contains a Docker Compose stack with:
 
-### ClickHouse
-
-The `siem` database contains:
-
-- `enriched_events` — normalized security telemetry
-- `alerts` — detector output
-- `alert_hourly_rollup` — aggregated alert counts and maximum scores
-- a materialized view that maintains the hourly alert rollup
-
-The primary sort keys are designed around source type, source IP, and event time for common analyst queries.
-
-Retention is configured in the schema as:
-
-- enriched events: **90 days**
-- alerts: **365 days**
-
-Adjust these values for the retention and compliance requirements of the environment where the system is deployed.
+- Kafka
+- Kafka topic initializer
+- ClickHouse
+- Flink JobManager
+- 2 Flink TaskManagers
+- Go forwarder
+- optional Go load generator
 
 ---
 
-## Synthetic load generator
+# Quick start
 
-The Go load generator produces realistic-looking authentication, DNS, and firewall records at a configurable rate.
+## 1. Clone and enter the repository
 
-It deliberately plants known detection patterns so the pipeline can be tested against ground truth:
-
-- two beaconing sources
-- one DNS-tunneling source
-- normal authentication failures
-- ordinary DNS queries
-- ordinary outbound firewall traffic
-
-The generator uses:
-
-```
-203.0.113.0/24
-198.51.100.0/24
+```bash
+git clone https://github.com/locallhosts/stream-siem.git
+cd stream-siem
 ```
 
-for simulated external destinations. These are reserved documentation ranges, so they should not be interpreted as real C2 infrastructure or company-owned addresses.
+## 2. Configure local ClickHouse credentials
 
-Example:
+Create a local `.env` file:
+
+```dotenv
+CLICKHOUSE_USER=siem
+CLICKHOUSE_PASSWORD=change_this_for_your_environment
+```
+
+The file is ignored by Git. Do not commit real credentials.
+
+## 3. Start Docker infrastructure
+
+```bash
+docker compose config
+docker compose up -d
+docker compose ps
+```
+
+Expected services include:
 
 ```
-10.0.6.200  -> 198.51.100.77:443
-10.0.6.201  -> 198.51.100.77:443
-10.0.7.50   -> high-entropy DNS labels
+kafka
+clickhouse
+flink-jobmanager
+flink-taskmanager
+forwarder
 ```
 
-The generator is deterministic by default through a fixed PRNG seed, making repeated test runs easier to compare.
+The load generator is intentionally disabled by default.
+
+Check service health:
+
+```bash
+docker compose ps
+docker compose logs --tail=100 kafka
+docker compose logs --tail=100 clickhouse
+docker compose logs --tail=100 flink-jobmanager
+docker compose logs --tail=100 forwarder
+```
 
 ---
 
-## Local development
+# Kafka verification
 
-### Requirements
+List topics:
 
-- Docker and Docker Compose
-- Go
-- Java 17
-- Maven
-- Python 3
+```bash
+docker exec siem-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka:29092 \
+  --list
+```
 
-### 1. Start the infrastructure
+The development stack creates:
+
+```
+siem.raw.events
+siem.alerts
+siem.dead-letters
+```
+
+Check raw-event offsets:
+
+```bash
+docker exec siem-kafka /opt/kafka/bin/kafka-get-offsets.sh \
+  --bootstrap-server kafka:29092 \
+  --topic siem.raw.events
+```
+
+Consume alert messages:
+
+```bash
+docker exec -it siem-kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server kafka:29092 \
+  --topic siem.alerts \
+  --from-beginning
+```
+
+Inside Docker, Flink and the Go forwarder use:
+
+```
+kafka:29092
+```
+
+Host-side Kafka tools use:
+
+```
+localhost:9092
+```
+
+This distinction is important because Kafka advertises different listeners for containers and the host.
+
+---
+
+# ClickHouse verification
+
+Verify authentication:
+
+```bash
+docker compose exec clickhouse sh -lc \
+  'clickhouse-client \
+    --user "$CLICKHOUSE_USER" \
+    --password "$CLICKHOUSE_PASSWORD" \
+    --query "SELECT currentUser()"'
+```
+
+Expected:
+
+```
+siem
+```
+
+List databases:
+
+```bash
+docker compose exec clickhouse sh -lc \
+  'clickhouse-client \
+    --user "$CLICKHOUSE_USER" \
+    --password "$CLICKHOUSE_PASSWORD" \
+    --query "SHOW DATABASES"'
+```
+
+List SIEM tables:
+
+```bash
+docker compose exec clickhouse sh -lc \
+  'clickhouse-client \
+    --user "$CLICKHOUSE_USER" \
+    --password "$CLICKHOUSE_PASSWORD" \
+    --database siem \
+    --query "SHOW TABLES"'
+```
+
+Query enriched events:
+
+```bash
+docker compose exec clickhouse sh -lc \
+  'clickhouse-client \
+    --user "$CLICKHOUSE_USER" \
+    --password "$CLICKHOUSE_PASSWORD" \
+    --database siem \
+    --query "SELECT event_time, source_type, source_ip, dest_ip, dest_port FROM enriched_events ORDER BY event_time DESC LIMIT 20"'
+```
+
+Query alerts:
+
+```bash
+docker compose exec clickhouse sh -lc \
+  'clickhouse-client \
+    --user "$CLICKHOUSE_USER" \
+    --password "$CLICKHOUSE_PASSWORD" \
+    --database siem \
+    --query "SELECT detected_at, alert_type, source_ip, dest_ip, score, details FROM alerts ORDER BY detected_at DESC LIMIT 20"'
+```
+
+Useful counts:
+
+```bash
+docker compose exec clickhouse sh -lc \
+  'clickhouse-client \
+    --user "$CLICKHOUSE_USER" \
+    --password "$CLICKHOUSE_PASSWORD" \
+    --database siem \
+    --query "SELECT count() FROM enriched_events"'
+
+docker compose exec clickhouse sh -lc \
+  'clickhouse-client \
+    --user "$CLICKHOUSE_USER" \
+    --password "$CLICKHOUSE_PASSWORD" \
+    --database siem \
+    --query "SELECT count() FROM alerts"'
+```
+
+---
+
+# Build and test the Java/Flink job
+
+The project uses Maven, not Gradle.
 
 From the repository root:
 
 ```bash
-docker compose up -d
+mvn -f flink-job/pom.xml clean verify
 ```
 
-This starts:
+This performs compilation, tests, packaging, and verification.
 
-- Kafka
-- ClickHouse
-- Flink JobManager
-- Flink TaskManagers
-- Go forwarder
-
-The load generator is optional and is not started by the default Compose profile.
-
-### 2. Build the Flink job
+Build only:
 
 ```bash
-cd flink-job
-mvn test
-mvn package
-cd ..
+mvn -f flink-job/pom.xml clean package
 ```
 
-The package step produces the fat JAR used by the Flink cluster.
+The shaded Flink artifact is:
 
-### 3. Submit the Flink job
+```
+flink-job/target/siem-flink-job-1.0.0.jar
+```
+
+Run the Flink unit tests:
+
+```bash
+mvn -f flink-job/pom.xml test
+```
+
+The test suite includes stateful detection tests such as:
+
+- regular 30-second beaconing traffic
+- irregular traffic that should remain silent
+- event-time/watermark driven operator behavior
+
+---
+
+# Submit the Flink job
+
+After building the JAR:
 
 ```bash
 docker compose exec flink-jobmanager flink run \
@@ -265,57 +410,188 @@ docker compose exec flink-jobmanager flink run \
   /opt/flink/usrlib/siem-flink-job-1.0.0.jar
 ```
 
-### 4. Generate test telemetry
+List jobs:
 
 ```bash
-docker compose --profile loadgen up loadgen
+curl -s http://localhost:8081/jobs/overview | python3 -m json.tool
 ```
 
-The default load generator runs at 2,000 events/second for 30 minutes.
-
-For a shorter local run, execute the binary directly:
-
-```bash
-cd go-forwarder
-go run ./cmd/loadgen -rate 1000 -duration 2m -out-dir ./synthetic-logs
-```
-
-### 5. Watch the pipeline
-
-Flink Web UI:
+Open the Flink Web UI:
 
 ```
 http://localhost:8081
 ```
 
-Kafka alert stream:
+The Web UI is useful for recording:
+
+- running job state
+- source partitions
+- operator state
+- checkpoints
+- task managers
+- parallelism
+- backpressure
+- operator throughput
+
+Check recent JobManager logs:
 
 ```bash
-docker compose logs -f flink-jobmanager | grep ALERT
+docker compose logs --tail=200 flink-jobmanager
 ```
 
-ClickHouse:
+Look specifically for successful source discovery, running operators, and completed checkpoints.
+
+---
+
+# Go forwarder tests
+
+The Go module lives under `go-forwarder/`.
+
+Run all Go tests:
 
 ```bash
-docker compose exec clickhouse clickhouse-client --database=siem \
-  --query "SELECT * FROM alerts ORDER BY detected_at DESC LIMIT 20"
+cd go-forwarder
+go test ./...
+```
+
+Build the forwarder:
+
+```bash
+go build ./cmd/forwarder
+```
+
+Build the synthetic load generator:
+
+```bash
+go build ./cmd/loadgen
+```
+
+Return to the repository root:
+
+```bash
+cd ..
+```
+
+The Docker forwarder uses:
+
+```
+go-forwarder/config.docker.yaml
+```
+
+It tails:
+
+```
+/var/log/siem/auth.log
+/var/log/siem/dns.log
+/var/log/siem/firewall.log
+```
+
+and sends normalized raw envelopes to:
+
+```
+siem.raw.events
+```
+
+Check forwarder logs:
+
+```bash
+docker compose logs -f forwarder
+```
+
+Check metrics:
+
+```bash
+curl http://localhost:9109/metrics
 ```
 
 ---
 
-## Local smoke test
+# Generate deterministic synthetic telemetry
 
-The repository includes `tools/local_pipeline_smoke_test.py`.
+The Go load generator plants known patterns for defensive validation.
 
-It is a fast, single-process validation path for:
+Planted sources:
 
-- log parser compatibility
-- detector behavior
+```
+10.0.6.200  -> 198.51.100.77:443
+10.0.6.201  -> 198.51.100.77:443
+10.0.7.50   -> high-entropy DNS labels
+```
+
+The destination ranges are reserved documentation ranges:
+
+```
+198.51.100.0/24
+203.0.113.0/24
+```
+
+They are test addresses, not indicators of real infrastructure.
+
+For a short Docker run:
+
+```bash
+docker compose --profile loadgen run --rm loadgen \
+  -rate 100 \
+  -duration 30s \
+  -out-dir /var/log/siem
+```
+
+For the configured default Compose load:
+
+```bash
+docker compose --profile loadgen up loadgen
+```
+
+The default service configuration generates approximately:
+
+```
+2,000 events/sec
+30 minutes
+```
+
+For direct local Go execution:
+
+```bash
+cd go-forwarder
+go run ./cmd/loadgen \
+  -rate 100 \
+  -duration 2m \
+  -out-dir ./synthetic-logs
+cd ..
+```
+
+---
+
+# Python smoke test
+
+The repository includes:
+
+```
+tools/local_pipeline_smoke_test.py
+```
+
+It mirrors the Java parser and detector logic in a fast single-process validation path.
+
+It validates:
+
+- authentication parsing
+- DNS parsing
+- firewall parsing
+- failed-login detection
+- beaconing detection
+- DNS entropy calculations
 - alert generation
+- ClickHouse schema compatibility
 - ClickHouse insertion
-- schema compatibility
 
-Example:
+Run syntax validation:
+
+```bash
+python3 -m py_compile tools/local_pipeline_smoke_test.py
+python3 -m py_compile tools/render_smoke_test_results.py
+```
+
+Run the smoke test against generated logs:
 
 ```bash
 python3 tools/local_pipeline_smoke_test.py \
@@ -326,13 +602,13 @@ python3 tools/local_pipeline_smoke_test.py \
   --clickhouse-insert
 ```
 
-The smoke test intentionally mirrors the Java parser and detector logic, but it is **not a replacement for the distributed Flink job**. It does not prove correctness under Kafka partitioning, real watermark progression, task failures, checkpoint recovery, or concurrent execution.
+The smoke test is intentionally not a replacement for Flink. It uses a single sorted-by-timestamp process and therefore does not prove distributed behavior under Kafka partitioning, out-of-order delivery, concurrent task execution, checkpoints, or recovery.
 
 ---
 
-## DNS baseline training
+# Python DNS model training
 
-The Python model trainer creates the baseline consumed by the Java DNS detector.
+Train the DNS baseline:
 
 ```bash
 python3 ml-model/train_dns_entropy_model.py \
@@ -340,57 +616,318 @@ python3 ml-model/train_dns_entropy_model.py \
   --output ./ml-model/model_params.json
 ```
 
-Optional tuning parameters include:
+Optional controls include:
 
-```bash
+```
 --z-score-threshold
 --min-queries-per-window
 --window-size-ms
 ```
 
-The generated JSON is intentionally compatible with `DnsTunnelingModelParams` in the Flink job.
-
-For the synthetic dataset used with this project, the DNS detector required threshold calibration because short hexadecimal labels have a practical entropy ceiling below their theoretical alphabet maximum. The included smoke-test output documents that tuning process rather than hiding the initial false negative.
+The generated model parameters are consumed by the Java DNS detector.
 
 ---
 
-## Go forwarder
+# Verified local end-to-end test
 
-The forwarder supports:
+One of the completed local validation runs processed:
 
-- file tailing
-- syslog UDP ingestion
-- batching
-- Kafka delivery
-- compression
-- configurable retries
-- Prometheus-style metrics
-- bounded buffering/backpressure
+| Metric | Result |
+|---|---:|
+| Authentication events parsed | 7,176 |
+| DNS events parsed | 7,234 |
+| Firewall events parsed | 4,530 |
+| Total events | **18,940** |
+| Enriched ClickHouse rows inserted | **18,940** |
+| Alerts generated | **13** |
+| Failed-login alerts | **10** |
+| Beaconing alerts | **3** |
+| DNS-tunneling alerts | **0** |
 
-Configuration example:
+The beaconing validation included the planted sources:
 
-```yaml
-node_id: forwarder-01
-
-kafka:
-  brokers:
-    - kafka:9092
-  topic: siem.raw.events
-  batch_size: 500
-  batch_timeout: 1s
-  compression: snappy
-  required_acks: 1
-  max_retries: 5
+```
+10.0.6.200 -> 198.51.100.77
+10.0.6.201 -> 198.51.100.77
 ```
 
-For higher durability requirements on a replicated Kafka cluster, configure acknowledgements appropriately for the deployment rather than using the single-node development defaults.
+The Python smoke test reported beaconing detections with approximately 30-second intervals and CV values below the configured 0.15 threshold.
+
+The DNS detector result of zero in this particular baseline run is intentional test information: the baseline was trained from the same synthetic distribution. The DNS detector should be tested separately with deliberately anomalous DNS input rather than changing the detector merely to force an alert.
 
 ---
 
-## Project structure
+# Full distributed pipeline test
+
+For a true end-to-end test, run the components in this order:
+
+### 1. Start infrastructure
+
+```bash
+docker compose up -d
+```
+
+### 2. Build Java
+
+```bash
+mvn -f flink-job/pom.xml clean verify
+```
+
+### 3. Submit Flink
+
+```bash
+docker compose exec flink-jobmanager flink run \
+  -c com.siem.jobs.SiemStreamJob \
+  /opt/flink/usrlib/siem-flink-job-1.0.0.jar
+```
+
+### 4. Start synthetic telemetry
+
+```bash
+docker compose --profile loadgen run --rm loadgen \
+  -rate 100 \
+  -duration 70s \
+  -out-dir /var/log/siem
+```
+
+### 5. Watch Kafka
+
+```bash
+docker exec siem-kafka /opt/kafka/bin/kafka-get-offsets.sh \
+  --bootstrap-server kafka:29092 \
+  --topic siem.raw.events
+```
+
+### 6. Watch Flink
+
+```bash
+docker compose logs -f flink-jobmanager
+```
+
+### 7. Query ClickHouse
+
+```bash
+docker compose exec clickhouse sh -lc \
+  'clickhouse-client \
+    --user "$CLICKHOUSE_USER" \
+    --password "$CLICKHOUSE_PASSWORD" \
+    --database siem \
+    --query "SELECT alert_type, source_ip, dest_ip, score FROM alerts ORDER BY detected_at DESC LIMIT 30"'
+```
+
+This gives a complete:
+
+```
+Go generator
+    ↓
+shared log volume
+    ↓
+Go forwarder
+    ↓
+Kafka
+    ↓
+Flink
+    ↓
+detectors
+    ↓
+ClickHouse + Kafka alerts
+    ↓
+Web UI / analyst view
+```
+
+---
+
+# Rendering the verification image
+
+The repository contains:
+
+```
+tools/render_smoke_test_results.py
+```
+
+It creates:
+
+```
+docs/images/smoke-test-results.png
+docs/images/smoke-test-results-full.png
+```
+
+Run:
+
+```bash
+python3 tools/render_smoke_test_results.py
+```
+
+Open it on macOS:
+
+```bash
+open docs/images/smoke-test-results.png
+```
+
+The image is intended as a reproducible README artifact showing:
+
+- event counts
+- detector counts
+- source IPs
+- destination IPs
+- alert scores
+- ClickHouse alert output
+- planted validation sources
+
+It should not be described as a live Flink/Kafka screenshot.
+
+---
+
+# Web UI / screen-recording checklist
+
+The Web UI should expose the same evidence that was validated from the command line.
+
+For a clean project demonstration, record these stages:
+
+### Infrastructure
+
+```bash
+docker compose ps
+```
+
+Show Kafka, ClickHouse, JobManager, TaskManagers, and forwarder.
+
+### Java/Flink
+
+```bash
+mvn -f flink-job/pom.xml clean verify
+```
+
+Then show the Flink Web UI:
+
+```
+http://localhost:8081
+```
+
+### Go
+
+```bash
+cd go-forwarder
+go test ./...
+go build ./cmd/forwarder
+go build ./cmd/loadgen
+cd ..
+```
+
+### Python
+
+```bash
+python3 -m compileall -q ml-model tools
+```
+
+Then run the local smoke test.
+
+### Kafka
+
+Show:
+
+```
+siem.raw.events
+siem.alerts
+siem.dead-letters
+```
+
+and the changing raw-event offsets.
+
+### ClickHouse
+
+Show:
+
+```
+enriched_events
+alerts
+alert_hourly_rollup
+```
+
+and query source IP → destination IP → score.
+
+### Detection
+
+Show the planted:
+
+```
+10.0.6.200
+10.0.6.201
+10.0.7.50
+```
+
+and the resulting detector output.
+
+### Final dashboard
+
+The final Web UI should make the complete path visible:
+
+```
+INGEST
+  ↓
+PARSE
+  ↓
+DETECT
+  ↓
+ALERT
+  ↓
+STORE
+  ↓
+VISUALIZE
+```
+
+This makes the screen recording demonstrate the actual system rather than a static UI.
+
+---
+
+# CI
+
+GitHub Actions validates four areas:
+
+### Java / Maven
+
+```bash
+mvn -B -ntp clean verify -f flink-job/pom.xml
+```
+
+### Go
+
+```bash
+go test ./...
+go build ./cmd/forwarder
+go build ./cmd/loadgen
+```
+
+### Python
+
+```bash
+python -m compileall -q ml-model tools
+```
+
+### Docker Compose
+
+```bash
+docker compose config -q
+```
+
+The workflow is under:
+
+```
+.github/workflows/gradle.yml
+```
+
+The filename is historical; the workflow itself now uses Maven rather than Gradle.
+
+---
+
+# Project structure
 
 ```
 .
+├── .github/
+│   └── workflows/
+│       └── gradle.yml
+│
 ├── clickhouse/
 │   ├── schema.sql
 │   ├── schema.local-smoke-test.sql
@@ -400,23 +937,23 @@ For higher durability requirements on a replicated Kafka cluster, configure ackn
 │   ├── pom.xml
 │   └── src/
 │       ├── main/java/com/siem/
-│       │   ├── functions/     # Detection operators
-│       │   ├── jobs/          # Flink entry point
-│       │   ├── model/         # Event, alert and model types
-│       │   ├── parse/         # Source parsers
-│       │   └── sink/          # Kafka and ClickHouse sinks
+│       │   ├── functions/
+│       │   ├── jobs/
+│       │   ├── model/
+│       │   ├── parse/
+│       │   └── sink/
 │       └── test/
 │
 ├── go-forwarder/
 │   ├── cmd/
-│   │   ├── forwarder/         # Log shipper
-│   │   └── loadgen/           # Synthetic telemetry generator
+│   │   ├── forwarder/
+│   │   └── loadgen/
 │   ├── internal/
 │   │   ├── config/
 │   │   ├── metrics/
 │   │   ├── sink/
 │   │   └── source/
-│   └── config.example.yaml
+│   └── config.docker.yaml
 │
 ├── ml-model/
 │   ├── train_dns_entropy_model.py
@@ -427,85 +964,72 @@ For higher durability requirements on a replicated Kafka cluster, configure ackn
 │   └── render_smoke_test_results.py
 │
 ├── docs/
-│   └── smoke_test_results.png
+│   └── images/
+│       ├── smoke-test-results.png
+│       └── smoke-test-results-full.png
 │
 └── docker-compose.yml
 ```
 
 ---
 
-## Testing
+# ClickHouse data model
 
-The Flink project includes unit tests for the stateful detection components, including:
+The `siem` database contains:
 
-- beaconing detection
-- entropy calculations
+- `enriched_events`
+- `alerts`
+- `alert_hourly_rollup`
+- `alert_hourly_rollup_mv`
 
-Run them with:
-
-```bash
-cd flink-job
-mvn test
-```
-
-The repository also provides the local smoke test for rapid parser/detector/schema validation.
-
-For a full system validation, use Docker Compose and exercise the complete:
+The enriched event model includes:
 
 ```
-load generator
-    -> Go forwarder
-    -> Kafka
-    -> Flink
-    -> ClickHouse + Kafka alerts
+event_time
+source_type
+source_ip
+dest_ip
+dest_port
+user
+auth_success
+dns_query
+host
+raw
+ingested_at
+```
+
+Alert records include:
+
+```
+detected_at
+window_start
+window_end
+alert_type
+source_type
+source_ip
+dest_ip
+score
+details
 ```
 
 ---
 
-## Configuration
-
-The Flink job exposes runtime parameters for the main detection controls.
-
-Examples:
-
-```
---kafka-brokers
---raw-topic
---alert-topic
---dead-letter-topic
---consumer-group
-
---failed-login-threshold
-
---beacon-max-samples
---beacon-min-samples
---beacon-max-cv
---beacon-min-interval-ms
---beacon-max-interval-ms
-
---dns-model-path
-```
-
-The defaults are intended for the included development environment. Detection thresholds should be calibrated against the actual baseline of the environment being monitored.
-
----
-
-## Operational considerations
+# Operational considerations
 
 This repository is a development and research implementation rather than a turnkey production deployment.
 
-Before production use, review at least:
+Before production use, review:
 
-- Kafka replication and acknowledgement settings
-- TLS and authentication for Kafka
+- Kafka replication and acknowledgements
+- Kafka TLS/authentication
 - ClickHouse authentication and network exposure
-- Flink checkpoint storage durability
+- durable Flink checkpoint storage
 - sink idempotency/deduplication
 - schema/version management
-- log timestamp normalization
-- DNS model training data quality
+- timestamp normalization
+- DNS training data quality
 - detector thresholds and false-positive rates
-- dead-letter queue monitoring
+- dead-letter monitoring
 - secrets management
 - retention and compliance requirements
 
@@ -513,20 +1037,20 @@ The Docker Compose configuration intentionally uses a single Kafka broker and de
 
 ---
 
-## Security model and scope
+# Security scope
 
-The synthetic traffic in this repository is designed for defensive testing of the detection pipeline.
+The synthetic traffic is designed for defensive testing of the detection pipeline.
 
-The project demonstrates **behavioral detection** rather than reputation-based blocking. In particular, a destination IP alone is not treated as malicious. The detectors look for patterns such as:
+The project demonstrates behavioral detection rather than reputation-based blocking. The detectors look for:
 
 - repeated authentication failures
 - periodic outbound connections
-- anomalously high DNS label entropy
+- anomalous DNS label entropy
 
-This distinction is important when interpreting the synthetic data: the reserved addresses used by the load generator are test infrastructure, not indicators of compromise.
+The reserved documentation IP addresses used by the generator are test infrastructure and should not be interpreted as real command-and-control infrastructure.
 
 ---
 
-## License
+# License
 
 See [LICENSE](LICENSE).
