@@ -65,10 +65,21 @@
       <classifier>http</classifier>
     </dependency>
 
-    <!-- JSON parsing of the raw envelope produced by the Go forwarder -->
+    <!-- JSON parsing of the raw envelope produced by the Go forwarder.
+         Keep the Jackson core modules aligned with databind. -->
     <dependency>
       <groupId>com.fasterxml.jackson.core</groupId>
       <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-core</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-annotations</artifactId>
       <version>${jackson.version}</version>
     </dependency>
     <dependency>
